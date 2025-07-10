@@ -1,0 +1,19 @@
+jax
+flax 
+optax
+matplotlib
+pandas
+numpy
+duckdb
+scikit-learn
+# For the dataloader
+torch
+pyarrow
+#tensorflow_datasets
+#tensorflow
+duckdb
+ipykernel
+cloudpickle
+safetensors
+## For NLP
+tokenizers
