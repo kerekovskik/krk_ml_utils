@@ -745,25 +745,9 @@ class RelativePositionBias(nnx.Module):
     """
     Implements the T5-style Relative Position Bias.
 
-    This module calculates a bias tensor that is added to the attention scores
-    (logits) before the softmax operation. Instead of using absolute positional
-    encodings, this mechanism allows the model to learn relationships based on the
-
-    relative distance between the query and key positions in the sequence.
-
-    Key Concepts:
-    1.  **Bucketing:** To keep the number of parameters manageable, relative
-        positions are not learned individually. Instead, they are grouped into a
-        fixed number of "buckets". Small distances get their own buckets, while
-        larger distances are grouped together logarithmically.
-    2.  **Bidirectionality:** The bucketing is handled differently for causal
-        (decoder self-attention) and non-causal (encoder self-attention or
-        cross-attention) scenarios.
-    3.  **Learned Parameters:** The actual bias values for each bucket and each
-        attention head are learned parameters.
-
-    This implementation is designed to be called once per forward pass to generate
-    the bias matrix, which can then be added to the attention scores.
+    This module computes a bias tensor to be added to attention scores. It allows
+    the model to learn relationships based on the relative distance between
+    query and key positions. It is shared across all attention layers in the model.
     """
     def __init__(self,
                  num_buckets: int,
@@ -771,24 +755,9 @@ class RelativePositionBias(nnx.Module):
                  num_heads: int,
                  *,
                  rngs: nnx.Rngs):
-        """
-        Initializes the RelativePositionBias module.
-
-        Args:
-            num_buckets: The total number of buckets to group relative positions into.
-            max_distance: The maximum relative distance to consider before clipping.
-                          Any distance beyond this will be assigned to the same bucket.
-            num_heads: The number of attention heads in the parent MultiHeadAttention layer.
-                       Each head will have its own set of learned bucket biases.
-            rngs: The JAX random number generators required by Flax NNX.
-        """
         self.num_buckets = num_buckets
         self.max_distance = max_distance
         self.num_heads = num_heads
-
-        # The core learnable parameter of this module. It's a lookup table where
-        # each row corresponds to an attention head and each column corresponds to a bucket.
-        # Shape: (num_heads, num_buckets)
         self.relative_attention_bias = nnx.Param(
             nnx.initializers.normal(stddev=1.0)(rngs.params(), (num_heads, num_buckets))
         )
@@ -798,106 +767,63 @@ class RelativePositionBias(nnx.Module):
                                   bidirectional: bool,
                                   num_buckets: int,
                                   max_distance: int) -> jnp.ndarray:
-        """
-        Calculates the bucket index for a given relative position.
-
-        This static method contains the core bucketing logic.
-
-        Args:
-            relative_position: A tensor of relative distances between query and key positions.
-            bidirectional: A boolean indicating if the attention is bidirectional (e.g., in an
-                           encoder) or unidirectional (e.g., causal attention in a decoder).
-            num_buckets: The total number of buckets.
-            max_distance: The maximum distance to consider.
-
-        Returns:
-            A tensor of the same shape as `relative_position` containing the
-            corresponding bucket indices.
-        """
-        # This will hold the final bucket indices.
+        """Calculates the bucket index for a given relative position."""
         ret = 0
-        n = -relative_position  # Distances are positive for past keys.
+        n = relative_position
 
         if bidirectional:
-            # For bidirectional attention, we use half the buckets for forward
-            # positions and half for backward positions.
             num_buckets //= 2
-            # Buckets for positive relative positions (queries ahead of keys)
+            # FINAL FIX: Correctly handle future vs. past positions.
+            # When n < 0 (i < j), the key is in the future relative to the query.
+            # Map these to the second half of the buckets.
             ret += (n < 0).astype(jnp.int32) * num_buckets
-            # We work with the absolute distance from now on.
             n = jnp.abs(n)
         else:
-            # For unidirectional (causal) attention, all keys are in the past,
-            # so 'n' will always be non-negative.
+            # For causal attention (unidirectional), we only attend to past keys.
+            # n = i - j is always >= 0. We want to work with the distance, so we flip the sign.
+            # This makes the logic consistent with how T5 handles it internally.
+            n = -n
             n = jnp.maximum(n, 0)
 
         # --- Logarithmic Bucketing for Larger Distances ---
-
-        # All positions within `max_distance` are considered.
         max_exact = num_buckets // 2
-        is_small = (n < max_exact)
+        is_small = n < max_exact
 
-        # For distances within the `max_exact` range, the bucket index is simply
-        # the distance itself.
         val_if_large = max_exact + (
             jnp.log(n.astype(jnp.float32) / max_exact)
             / jnp.log(max_distance / max_exact)
             * (num_buckets - max_exact)
         ).astype(jnp.int32)
-
-        # Clip the large-value buckets to ensure they don't exceed the total number of buckets.
         val_if_large = jnp.minimum(val_if_large, num_buckets - 1)
 
-        # Combine the small and large distance buckets.
         ret += jnp.where(is_small, n, val_if_large)
         return ret
 
     def __call__(self, q_len: int, k_len: int, bidirectional: bool) -> jnp.ndarray:
-        """
-        Computes the relative position bias tensor.
-
-        Args:
-            q_len: The sequence length of the query.
-            k_len: The sequence length of the key.
-            bidirectional: True for encoder self-attention/cross-attention, False
-                           for decoder causal self-attention.
-
-        Returns:
-            A bias tensor of shape: (1, num_heads, q_len, k_len)
-            This shape is designed to be broadcast-added to the attention scores.
-        """
-        # 1. Create context and query position tensors.
-        # Shape: (q_len,) and (k_len,)
-        context_position = jnp.arange(k_len, dtype=jnp.int32)
+        """Computes the relative position bias tensor."""
         query_position = jnp.arange(q_len, dtype=jnp.int32)
+        key_position = jnp.arange(k_len, dtype=jnp.int32)
 
-        # 2. Calculate the matrix of relative positions.
-        # This uses broadcasting to create a (q_len, k_len) matrix where
-        # each element `matrix[i, j] = i - j`.
-        # Shapes: (q_len, 1) - (1, k_len) -> (q_len, k_len)
-        relative_position = context_position[jnp.newaxis, :] - query_position[:, jnp.newaxis]
+        # Correct calculation: query_pos - key_pos (i - j)
+        relative_position = query_position[:, jnp.newaxis] - key_position[jnp.newaxis, :]
 
-        # 3. Calculate the bucket index for each relative position.
-        # The output `rp_bucket` is a (q_len, k_len) matrix of integer bucket IDs.
         rp_bucket = self._relative_position_bucket(
             relative_position,
             bidirectional=bidirectional,
             num_buckets=self.num_buckets,
-            max_distance=self.max_distance
+            max_distance=self.max_distance,
         )
 
-        # 4. Use the bucket IDs to look up the learned bias values.
-        # self.relative_attention_bias has shape (num_heads, num_buckets).
-        # We index it with `rp_bucket` to get the bias for each position.
-        # The result `values` will have shape (num_heads, q_len, k_len).
-        values = self.relative_attention_bias.value.T[rp_bucket] # Transpose for easier gathering
+        # Gather the bias values from the learned embedding table.
+        # The .value is already a JAX array, so jnp.asarray is redundant.
+        values = self.relative_attention_bias.value[:, rp_bucket]
 
-        # 5. Reshape to be compatible with attention logits.
-        # Final shape: (1, num_heads, q_len, k_len) for broadcasting.
-        bias = values.transpose(2, 0, 1)[jnp.newaxis, ...]
+        # Reshape for broadcasting: (1, num_heads, q_len, k_len)
+        bias = jnp.expand_dims(values, axis=0)
         return bias
-    
-    
+
+
+ 
 class TransformerEncoderLayer_t5(nnx.Module):
     """
     A single layer of the Transformer Encoder with T5-style modifications.

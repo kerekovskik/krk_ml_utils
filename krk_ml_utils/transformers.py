@@ -212,19 +212,17 @@ class Vanilla_Transformer_v1(nnx.Module):
 
 
 ### T5ish
-
 class T5_Style_Transformer(nnx.Module):
     """
     A T5-style encoder-decoder Transformer.
 
     This model implements the key architectural changes from the T5 paper:
-    1.  **Pre-Layer Normalization:** LayerNorm is applied before each sub-layer
-        for improved training stability.
-    2.  **Simplified LayerNorm:** The LayerNorm modules do not have a learnable
-        additive bias (`beta`).
-    3.  **Relative Position Biases:** Uses a single, shared set of learned
-        relative position biases injected directly into the attention scores,
-        instead of absolute positional encodings.
+    1.  **Pre-Layer Normalization:** LayerNorm is applied before each sub-layer.
+    2.  **Simplified LayerNorm:** LayerNorm modules do not have a learnable additive bias.
+    3.  **Relative Position Biases:** Uses a shared, learned relative position bias
+        injected into the attention scores, replacing absolute positional encodings.
+    4.  **No Embedding Scaling:** The `sqrt(d_model)` scaling on embeddings is removed.
+    5.  **Final Decoder LayerNorm:** A final LayerNorm is applied to the decoder output.
     """
 
     def __init__(self,
@@ -232,27 +230,28 @@ class T5_Style_Transformer(nnx.Module):
                  d_model: int,
                  num_layers_enc: int,
                  num_layers_dec: int,
-                 num_heads_enc: int,
-                 num_heads_dec: int,
-                 d_dff_enc: int,
-                 d_dff_dec: int,
+                 num_heads: int, # T5 shares this, so only one parameter is needed
+                 d_dff: int, # T5 shares this
                  dropout_rate: float = 0.1,
+                 num_rel_pos_buckets: int = 32, # FIX: Made configurable
+                 max_rel_pos_distance: int = 128, # FIX: Made configurable
                  seed: int = 42,
-                 # T5 MODIFICATION: max_seq_length is no longer needed for positional encodings
-                 # but can be kept for other purposes if desired (e.g., initializing caches).
-                 max_seq_length: int = 512):
+                 max_seq_length: int = 512): # Kept for generate method cache sizing
         super().__init__()
+        # FIX: Added assertions for robustness
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
         # Store model hyperparameters
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.num_layers_enc = num_layers_enc
         self.num_layers_dec = num_layers_dec
-        self.num_heads_enc = num_heads_enc
-        self.num_heads_dec = num_heads_dec
-        self.d_dff_enc = d_dff_enc
-        self.d_dff_dec = d_dff_dec
+        self.num_heads = num_heads
+        self.d_dff = d_dff
         self.dropout_rate = dropout_rate
-        self.max_seq_length = max_seq_length # Keep for generate method cache sizing
+        self.num_rel_pos_buckets = num_rel_pos_buckets
+        self.max_rel_pos_distance = max_rel_pos_distance
+        self.max_seq_length = max_seq_length
         self.seed = seed
         self.rngs = nnx.Rngs(self.seed)
         # Call the separated initialization function
@@ -267,83 +266,61 @@ class T5_Style_Transformer(nnx.Module):
              rngs=self.rngs
         )
 
-        # T5 MODIFICATION: A standard T5 model uses the same number of heads
-        # for both encoder and decoder to allow for sharing position biases.
-        if self.num_heads_enc != self.num_heads_dec:
-            raise ValueError(
-                "T5 architecture shares position biases, which requires "
-                "encoder and decoder to have the same number of heads."
-            )
-
-        # T5 MODIFICATION: Initialize the relative position bias module ONCE for the entire model.
-        # This single instance will be passed to and shared by all attention layers.
+        # Initialize the single, shared relative position bias module.
         self.relative_position_bias = RelativePositionBias(
-            num_buckets=32,       # As per the T5 paper
-            max_distance=128,     # As per the T5 paper
-            num_heads=self.num_heads_enc,
+            num_buckets=self.num_rel_pos_buckets,
+            max_distance=self.max_rel_pos_distance,
+            num_heads=self.num_heads,
             rngs=self.rngs
         )
 
-        # T5 MODIFICATION: We no longer need the absolute PositionalEncoding module.
-        # self.pos_encoding = ... IS REMOVED
-
-        # A single dropout layer applied to the embeddings after scaling.
+        # A single dropout layer applied to the embeddings.
         self.dropout = nnx.Dropout(rate=self.dropout_rate, rngs=self.rngs)
 
-        # Initialize the T5-style encoder, passing the shared bias module.
+        # Initialize the T5-style encoder.
         self.encoder = TransformerEncoder_t5(
             num_layers=self.num_layers_enc,
             d_model=self.d_model,
-            num_heads=self.num_heads_enc,
-            d_ff=self.d_dff_enc,
+            num_heads=self.num_heads,
+            d_ff=self.d_dff,
             dropout_rate=self.dropout_rate,
             relative_position_bias_module=self.relative_position_bias,
             rngs=self.rngs
         )
 
-        # Initialize the T5-style decoder, passing the same shared bias module.
+        # Initialize the T5-style decoder.
         self.decoder = TransformerDecoder_t5(
             num_layers=self.num_layers_dec,
             d_model=self.d_model,
-            num_heads=self.num_heads_dec,
-            d_ff=self.d_dff_dec,
+            num_heads=self.num_heads,
+            d_ff=self.d_dff,
             dropout_rate=self.dropout_rate,
             relative_position_bias_module=self.relative_position_bias,
             rngs=self.rngs
         )
 
-    def __call__(self, source_tokens: jnp.ndarray, target_tokens: jnp.ndarray, training: bool = False, pad_token_id: int = 250002) -> jnp.ndarray:
-        """
-        Performs the full forward pass for training.
-        """
+        # FIX: Add the final LayerNorm for the decoder output stack.
+        self.final_layer_norm = nnx.LayerNorm(num_features=self.d_model, use_bias=False, rngs=self.rngs)
+
+
+    def __call__(self, source_tokens: jnp.ndarray, target_tokens: jnp.ndarray, training: bool = False, pad_token_id: int = 0) -> jnp.ndarray:
+        """Performs the full forward pass for training."""
         # 1. Create attention masks.
         source_mask = create_padding_mask(source_tokens, pad_token_id=pad_token_id)
         target_padding_mask = create_padding_mask(target_tokens, pad_token_id=pad_token_id)
         target_causal_mask = create_causal_mask(target_tokens.shape[1])
         target_mask = target_padding_mask & target_causal_mask
 
-        # 2. Process source sequence through the embedding layer.
+        # 2. Process source sequence.
         source_emb = self.embedding(source_tokens)
-        # Apply embedding scaling. Note: The original paper scales by sqrt(d_model).
-        # Some implementations (like T5's own) omit this, but we keep it for now.
-        source_emb = source_emb * jnp.sqrt(self.d_model)
-
-        # T5 MODIFICATION: REMOVE absolute positional encoding.
-        # source_emb = self.pos_encoding(source_emb) <-- THIS IS REMOVED
+        # FIX: REMOVED embedding scaling `* jnp.sqrt(self.d_model)`
         source_emb = self.dropout(source_emb, deterministic=not training)
-
-        # 3. Pass source embeddings through the T5-style encoder.
         encoder_context = self.encoder(source_emb, mask=source_mask, training=training)
 
-        # 4. Process target sequence through the embedding layer.
+        # 3. Process target sequence.
         target_embed = self.embedding(target_tokens)
-        target_embed = target_embed * jnp.sqrt(self.d_model)
-
-        # T5 MODIFICATION: REMOVE absolute positional encoding.
-        # target_embed = self.pos_encoding(target_embed) <-- THIS IS REMOVED
+        # FIX: REMOVED embedding scaling `* jnp.sqrt(self.d_model)`
         target_embed = self.dropout(target_embed, deterministic=not training)
-
-        # 5. Pass target embeddings and encoder context through the T5-style decoder.
         decoder_output = self.decoder(
             y=target_embed,
             encoder_context=encoder_context,
@@ -352,28 +329,25 @@ class T5_Style_Transformer(nnx.Module):
             training=training
         )
 
-        # 6. Final Projection to Logits using tied weights.
-        logits = decoder_output @ self.embedding.embedding.T
+        # 4. Final Processing before Logit Projection.
+        # FIX: Apply the final LayerNorm to the decoder's output.
+        normalized_decoder_output = self.final_layer_norm(decoder_output)
+
+        # 5. Final Projection to Logits using tied weights.
+        logits = normalized_decoder_output @ self.embedding.embedding.T
         return logits
 
-    def generate(self, source_tokens: jnp.ndarray, start_token_id: int, max_generate_len: int, eos_token_id: int, pad_token_id: int = -1):
-        """
-        Generates a sequence of tokens autoregressively using KV caching.
-        """
+    def generate(self, source_tokens: jnp.ndarray, start_token_id: int, max_generate_len: int, eos_token_id: int, pad_token_id: int = 0):
+        """Generates a sequence of tokens autoregressively using KV caching."""
         batch_size = source_tokens.shape[0]
 
         # --- Phase 1: One-Time Encoder Pass ---
         source_mask = create_padding_mask(source_tokens, pad_token_id)
-
         source_emb = self.embedding(source_tokens)
-        source_emb = source_emb * jnp.sqrt(self.d_model)
-        # T5 MODIFICATION: REMOVE absolute positional encoding.
-        # source_emb = self.pos_encoding(source_emb, start_index=0) <-- THIS IS REMOVED
+        # FIX: REMOVED embedding scaling
         encoder_context = self.encoder(source_emb, mask=source_mask, training=False)
 
         # --- Phase 2: One-Time Cache Initialization ---
-        # The `init_cache` method now resides on the decoder stack. It will
-        # pre-compute cross-attention K/V and pre-allocate self-attention K/V.
         self.decoder.init_cache(batch_size, max_generate_len, encoder_context)
 
         # --- Phase 3: The Autoregressive Loop ---
@@ -381,24 +355,21 @@ class T5_Style_Transformer(nnx.Module):
 
         for t in range(max_generate_len - 1):
             last_token = generated_tokens[:, -1]
-
-            # Embed the single last token.
             token_emb = self.embedding(last_token)
-            token_emb = token_emb * jnp.sqrt(self.d_model)
-            token_emb = token_emb[:, jnp.newaxis, :] # Add sequence dimension
+            # FIX: REMOVED embedding scaling
+            token_emb = token_emb[:, jnp.newaxis, :]
 
-            # T5 MODIFICATION: REMOVE absolute positional encoding for the current step.
-            # token_emb_pos = self.pos_encoding(token_emb, start_index=t) <-- THIS IS REMOVED
-
-            # Call the decoder's cached generation step.
             decoder_output = self.decoder.generate_step(
-                y=token_emb, # Pass the raw embedding
+                y=token_emb,
                 cross_attn_mask=source_mask,
                 decode_step_index=t
             )
 
+            # FIX: Apply the final LayerNorm to the single-step decoder output
+            normalized_decoder_output = self.final_layer_norm(decoder_output)
+
             # Project to logits and sample the next token.
-            logits = decoder_output @ self.embedding.embedding.T
+            logits = normalized_decoder_output @ self.embedding.embedding.T
             next_token = jnp.argmax(logits, axis=-1)
             generated_tokens = jnp.concatenate([generated_tokens, next_token], axis=1)
 
