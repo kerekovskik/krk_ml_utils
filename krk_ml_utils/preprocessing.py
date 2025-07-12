@@ -490,7 +490,8 @@ def _fast_yaml_serialize(row_dict):
             elif isinstance(value, str):
                 # Simple string escaping
                 if '\n' in value or '"' in value or "'" in value:
-                    yaml_lines.append(f'{key}: "{value.replace('"', '\\"')}"')
+                    escaped_value = value.replace('"', '\\"')
+                    yaml_lines.append(f'{key}: "{escaped_value}"')
                 else:
                     yaml_lines.append(f"{key}: {value}")
             elif value is None:
@@ -503,7 +504,6 @@ def _fast_yaml_serialize(row_dict):
     except Exception:
         # Fallback to original method
         return yaml.dump(row_dict, allow_unicode=True, default_flow_style=False)
-
 
 def _process_chunk(chunk_data):
     """
