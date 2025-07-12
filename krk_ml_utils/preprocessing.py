@@ -652,7 +652,8 @@ def convert_for_text_to_text_regression_ultra_fast(df, target_column, precision=
                 # Simple string handling
                 value_str = str(value)
                 if '\n' in value_str or '"' in value_str:
-                    yaml_parts.append(f'{key}: "{value_str.replace('"', '\\"')}"')
+                    escaped_value = value_str.replace('"', '\\"')
+                    yaml_parts.append(f'{key}: "{escaped_value}"')
                 else:
                     yaml_parts.append(f"{key}: {value_str}")
         return '\n'.join(yaml_parts) + '\n'
