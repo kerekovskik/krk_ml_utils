@@ -14,7 +14,8 @@ class KVCache(nnx.Module):
         self.key = nnx.Variable(None)
         self.value = nnx.Variable(None)
         
-        
+
+
 class FFN(nnx.Module):
     """
     Implements the Position-wise Feed-Forward Network (FFN) sub-layer.
@@ -741,6 +742,43 @@ class PositionalEncoding(nnx.Module):
 
 
 ### T5
+
+class FFN_GEGLU(nnx.Module):
+    """
+    Implements the Gated GELU (GEGLU) Feed-Forward Network used in T5.
+    """
+    def __init__(self, d_model: int, d_ff: int, *, rngs: nnx.Rngs):
+        """
+        Initializes the GEGLU FFN.
+
+        Args:
+            d_model: The dimensionality of the input and output.
+            d_ff: The dimensionality of the inner "up-projection".
+            rngs: The JAX random number generators.
+        """
+        # The up-projection layer is split into two for the gating mechanism.
+        self.linear_gate = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
+        self.linear_up = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
+        # The down-projection layer.
+        self.linear_down = nnx.Linear(d_ff, d_model, use_bias=False, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+        # Project up to the intermediate dimension with two separate matrices.
+        gate = self.linear_gate(x)
+        up_proj = self.linear_up(x)
+
+        # Apply the GELU activation to the gate.
+        # As per the image you provided, approximate=True uses the tanh-based formula.
+        activated_gate = jax.nn.gelu(gate, approximate=True)
+
+        # Element-wise multiply the activated gate with the other projection.
+        gated_output = activated_gate * up_proj
+
+        # Project back down to the model dimension.
+        return self.linear_down(gated_output)
+    
+
+
 class RelativePositionBias(nnx.Module):
     """
     Implements the T5-style Relative Position Bias.
@@ -862,7 +900,7 @@ class TransformerEncoderLayer_t5(nnx.Module):
             relative_position_bias_module=relative_position_bias_module,
             rngs=rngs
         )
-        self.ffn = FFN(d_model=d_model, d_ff=d_ff, rngs=rngs)
+        self.ffn = FFN_GEGLU(d_model=d_model, d_ff=d_ff, rngs=rngs)
 
         # --- Layer Normalization and Dropout ---
         # Initialize two simplified LayerNorm modules (no bias) for pre-norm.
@@ -956,7 +994,7 @@ class TransformerDecoderLayer_t5(nnx.Module):
             relative_position_bias_module=relative_position_bias_module,
             rngs=rngs
         )
-        self.ffn = FFN(d_model=d_model, d_ff=d_ff, rngs=rngs)
+        self.ffn = FFN_GEGLU(d_model=d_model, d_ff=d_ff, rngs=rngs)
 
         # --- Layer Normalization and Dropout ---
         # Initialize three simplified LayerNorm modules (no bias) for the three sub-layers.
