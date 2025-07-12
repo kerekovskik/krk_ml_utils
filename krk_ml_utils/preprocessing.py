@@ -3,6 +3,9 @@ import yaml
 import pandas as pd
 import decimal
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
+import multiprocessing as mp
 
 class MinMax:
     """Min-Max normalizer that scales data to range [0,1].
@@ -422,3 +425,245 @@ def generate_p10_special_tokens(exponent_range: tuple = (-100, 100)) -> list:
         special_tokens.append(f'<E{sign}{abs(i)}>')
         
     return special_tokens
+
+
+## Optimizations
+
+def to_p10_string_vectorized(series, precision=3):
+    """
+    Vectorized version of to_p10_string for pandas Series.
+    
+    Args:
+        series (pd.Series): Series of numbers to convert
+        precision (int): Number of digits in mantissa
+        
+    Returns:
+        pd.Series: Series of P10 token strings
+    """
+    def _to_p10_single(number):
+        if pd.isna(number):
+            return None
+            
+        if not isinstance(precision, int) or precision <= 0:
+            raise ValueError("Precision must be a positive integer.")
+
+        # Handle zero case
+        if decimal.Decimal(str(number)).is_zero():
+            sign_token = '<+>'
+            mantissa_tokens = ''.join([f'<{d}>' for d in '0' * precision])
+            exponent_token = '<E+0>'
+            return f"{sign_token}{mantissa_tokens}{exponent_token}"
+
+        # Use Decimal for accurate arithmetic
+        ctx = decimal.Context(prec=precision)
+        d = decimal.Decimal(str(number))
+        
+        # Normalize to scientific notation
+        sign, digits, exponent = d.normalize(ctx).as_tuple()
+        
+        # Construct tokens
+        sign_token = '<->' if sign else '<+>'
+        mantissa_str = ''.join(map(str, digits)).ljust(precision, '0')
+        mantissa_tokens = ''.join([f'<{d}>' for d in mantissa_str])
+        
+        final_exponent = exponent + len(digits) - precision
+        exp_sign = '+' if final_exponent >= 0 else '-'
+        exponent_token = f'<E{exp_sign}{abs(final_exponent)}>'
+        
+        return f"{sign_token}{mantissa_tokens}{exponent_token}"
+    
+    return series.apply(_to_p10_single)
+
+
+def _fast_yaml_serialize(row_dict):
+    """
+    Fast YAML serialization for simple dictionaries.
+    Falls back to yaml.dump for complex cases.
+    """
+    try:
+        # For simple key-value pairs, build YAML manually (much faster)
+        yaml_lines = []
+        for key, value in row_dict.items():
+            # Handle basic types efficiently
+            if isinstance(value, (int, float)):
+                yaml_lines.append(f"{key}: {value}")
+            elif isinstance(value, str):
+                # Simple string escaping
+                if '\n' in value or '"' in value or "'" in value:
+                    yaml_lines.append(f'{key}: "{value.replace('"', '\\"')}"')
+                else:
+                    yaml_lines.append(f"{key}: {value}")
+            elif value is None:
+                yaml_lines.append(f"{key}: null")
+            else:
+                # Fall back to yaml.dump for complex types
+                return yaml.dump(row_dict, allow_unicode=True, default_flow_style=False)
+        
+        return '\n'.join(yaml_lines) + '\n'
+    except Exception:
+        # Fallback to original method
+        return yaml.dump(row_dict, allow_unicode=True, default_flow_style=False)
+
+
+def _process_chunk(chunk_data):
+    """
+    Process a chunk of data. This function needs to be at module level for multiprocessing.
+    
+    Args:
+        chunk_data: tuple of (chunk_df, target_column, precision, drop_columns)
+    
+    Returns:
+        pd.DataFrame: Processed chunk
+    """
+    chunk_df, target_column, precision, drop_columns = chunk_data
+    
+    # Make a copy to avoid modifying original
+    df_chunk = chunk_df.copy()
+    
+    # Drop specified columns
+    if drop_columns:
+        df_chunk = df_chunk.drop(columns=drop_columns, errors='ignore')
+    
+    # Vectorized P10 conversion for target column
+    if target_column in df_chunk.columns:
+        target_values = to_p10_string_vectorized(df_chunk[target_column], precision=precision)
+        df_chunk = df_chunk.drop(columns=[target_column])
+    else:
+        target_values = pd.Series([None] * len(df_chunk))
+    
+    # Convert to dictionaries and process
+    processed_rows = []
+    for idx, (_, row) in enumerate(df_chunk.iterrows()):
+        row_dict = row.to_dict()
+        yaml_features = _fast_yaml_serialize(row_dict)
+        
+        processed_rows.append({
+            "input": yaml_features,
+            "output": target_values.iloc[idx]
+        })
+    
+    return pd.DataFrame(processed_rows)
+
+
+def convert_for_text_to_text_regression_parallel(df, target_column, precision=10, drop_column_list: list = None, 
+                                       chunk_size: int = 50000, n_workers: int = None):
+    """
+    Convert a DataFrame for text-to-text regression tasks with optimized performance.
+    
+    Args:
+        df (pd.DataFrame): The input DataFrame containing the data.
+        target_column (str): The name of the target column to be used as output.
+        precision (int): Precision for P10 encoding. Defaults to 10.
+        drop_column_list (list, optional): List of columns to drop from the DataFrame. Defaults to None.
+        chunk_size (int): Size of chunks for processing. Defaults to 50000.
+        n_workers (int, optional): Number of parallel workers. Defaults to CPU count - 1.
+    
+    Returns:
+        pd.DataFrame: DataFrame with 'input' and 'output' columns.
+    """
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 1)
+    
+    # For small DataFrames, use single-threaded processing
+    if len(df) <= chunk_size:
+        return _process_chunk((df, target_column, precision, drop_column_list))
+    
+    # Split DataFrame into chunks
+    chunks = []
+    for i in range(0, len(df), chunk_size):
+        chunk = df.iloc[i:i + chunk_size]
+        chunks.append((chunk, target_column, precision, drop_column_list))
+    
+    # Process chunks in parallel
+    if n_workers > 1 and len(chunks) > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            # Submit all chunks
+            future_to_chunk = {executor.submit(_process_chunk, chunk): i 
+                             for i, chunk in enumerate(chunks)}
+            
+            # Collect results in order
+            results = [None] * len(chunks)
+            for future in as_completed(future_to_chunk):
+                chunk_idx = future_to_chunk[future]
+                try:
+                    import datetime
+                    start_time = datetime.datetime.now()
+                    
+                    results[chunk_idx] = future.result()
+                    # Get chunk size from the original chunks data
+                    chunk_df = chunks[chunk_idx][0]  # First element is the DataFrame
+                    chunk_size_actual = len(chunk_df)
+                    
+                    print(f"Processing chunk of size {chunk_size_actual} at {start_time}")
+                except Exception as exc:
+                    print(f'Chunk {chunk_idx} generated an exception: {exc}')
+                    # Process failed chunk sequentially as fallback
+                    results[chunk_idx] = _process_chunk(chunks[chunk_idx])
+            
+            # Combine all results
+            return pd.concat(results, ignore_index=True)
+    else:
+        # Single-threaded processing for chunks
+        results = []
+        for chunk_data in chunks:
+            results.append(_process_chunk(chunk_data))
+        return pd.concat(results, ignore_index=True)
+
+
+# Alternative ultra-fast version for simple cases
+def convert_for_text_to_text_regression_ultra_fast(df, target_column, precision=10, 
+                                                  drop_column_list: list = None):
+    """
+    Ultra-fast version that trades some flexibility for maximum speed.
+    Best for DataFrames with simple data types and no complex YAML requirements.
+    
+    Args:
+        df (pd.DataFrame): The input DataFrame containing the data.
+        target_column (str): The name of the target column to be used as output.
+        precision (int): Precision for P10 encoding. Defaults to 10.
+        drop_column_list (list, optional): List of columns to drop. Defaults to None.
+    
+    Returns:
+        pd.DataFrame: DataFrame with 'input' and 'output' columns.
+    """
+    # Work with a copy
+    df_work = df.copy()
+    
+    # Drop specified columns
+    if drop_column_list:
+        df_work = df_work.drop(columns=drop_column_list, errors='ignore')
+    
+    # Vectorized P10 conversion
+    if target_column in df_work.columns:
+        target_p10 = to_p10_string_vectorized(df_work[target_column], precision=precision)
+        df_work = df_work.drop(columns=[target_column])
+    else:
+        target_p10 = pd.Series([None] * len(df_work))
+    
+    # Ultra-fast YAML generation using string operations
+    def row_to_yaml_fast(row):
+        yaml_parts = []
+        for key, value in row.items():
+            if pd.isna(value):
+                yaml_parts.append(f"{key}: null")
+            elif isinstance(value, (int, float)):
+                yaml_parts.append(f"{key}: {value}")
+            else:
+                # Simple string handling
+                value_str = str(value)
+                if '\n' in value_str or '"' in value_str:
+                    yaml_parts.append(f'{key}: "{value_str.replace('"', '\\"')}"')
+                else:
+                    yaml_parts.append(f"{key}: {value_str}")
+        return '\n'.join(yaml_parts) + '\n'
+    
+    # Apply YAML conversion vectorized
+    yaml_inputs = df_work.apply(row_to_yaml_fast, axis=1)
+    
+    # Create result DataFrame
+    result_df = pd.DataFrame({
+        'input': yaml_inputs,
+        'output': target_p10
+    })
+    
+    return result_df
