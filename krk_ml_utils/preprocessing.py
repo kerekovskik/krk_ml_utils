@@ -668,3 +668,137 @@ def convert_for_text_to_text_regression_ultra_fast(df, target_column, precision=
     })
     
     return result_df
+
+
+
+### TOKENIZATION
+def _tokenize_chunk(chunk_data):
+    """Process a chunk of tokenization data."""
+    texts, tokenizer, prefix, suffix = chunk_data
+    
+    # Add prefix/suffix to all texts in chunk
+    formatted_texts = [f"{prefix}{text}{suffix}" for text in texts]
+    
+    # Tokenize the chunk
+    tokens = [tokenizer.encode_as_ids(text) for text in formatted_texts]
+    
+    return tokens
+
+def tokenize_columns_parallel(df, input_col="input", output_col="output", 
+                            tokenizer=None, chunk_size=10000, n_workers=None):
+    """
+    Parallel tokenization for large DataFrames.
+    
+    Args:
+        df: DataFrame with input/output columns
+        input_col: Name of input column
+        output_col: Name of output column
+        tokenizer: SentencePiece tokenizer object
+        chunk_size: Size of chunks for parallel processing
+        n_workers: Number of parallel workers
+    
+    Returns:
+        DataFrame with added token columns
+    """
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 1)
+    
+    df_result = df.copy()
+    
+    # Process input and output columns separately
+    for col_name, token_col_name in [(input_col, "input_tokens"), (output_col, "output_tokens")]:
+        texts = df_result[col_name].astype(str).tolist()
+        
+        if len(texts) <= chunk_size:
+            # Small dataset - process directly
+            tokens = _tokenize_chunk((texts, tokenizer, "<s>", "</s>"))
+            df_result[token_col_name] = tokens
+        else:
+            # Large dataset - process in parallel chunks
+            chunks = []
+            for i in range(0, len(texts), chunk_size):
+                chunk_texts = texts[i:i + chunk_size]
+                chunks.append((chunk_texts, tokenizer, "<s>", "</s>"))
+            
+            # Process chunks in parallel
+            if n_workers > 1:
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    future_to_chunk = {executor.submit(_tokenize_chunk, chunk): i 
+                                     for i, chunk in enumerate(chunks)}
+                    
+                    results = [None] * len(chunks)
+                    for future in as_completed(future_to_chunk):
+                        chunk_idx = future_to_chunk[future]
+                        results[chunk_idx] = future.result()
+                    
+                    # Flatten results
+                    all_tokens = []
+                    for result in results:
+                        all_tokens.extend(result)
+                    
+                    df_result[token_col_name] = all_tokens
+            else:
+                # Single-threaded chunk processing
+                all_tokens = []
+                for chunk in chunks:
+                    tokens = _tokenize_chunk(chunk)
+                    all_tokens.extend(tokens)
+                df_result[token_col_name] = all_tokens
+    
+    return df_result
+
+def tokenize_datasets_optimized(train_set, val_set, tokenizer, chunk_size=50000):
+    """
+    Optimized tokenization for train/val sets with progress tracking.
+    
+    Args:
+        train_set: Training DataFrame
+        val_set: Validation DataFrame  
+        tokenizer: SentencePiece tokenizer
+        chunk_size: Chunk size for processing
+    
+    Returns:
+        tuple: (tokenized_train_set, tokenized_val_set)
+    """
+    import time
+    
+    def tokenize_single_dataset(df, dataset_name):
+        print(f"Tokenizing {dataset_name} set ({len(df):,} rows)...")
+        start_time = time.time()
+        
+        # Vectorized string concatenation
+        input_texts = ("<s>" + df["input"].astype(str) + "</s>").tolist()
+        output_texts = ("<s>" + df["output"].astype(str) + "</s>").tolist()
+        
+        # Batch tokenization with progress
+        print(f"  Processing input tokens...")
+        input_tokens = []
+        for i in range(0, len(input_texts), chunk_size):
+            chunk = input_texts[i:i + chunk_size]
+            chunk_tokens = [tokenizer.encode_as_ids(text) for text in chunk]
+            input_tokens.extend(chunk_tokens)
+            print(f"    Processed {min(i + chunk_size, len(input_texts)):,}/{len(input_texts):,} inputs")
+        
+        print(f"  Processing output tokens...")
+        output_tokens = []
+        for i in range(0, len(output_texts), chunk_size):
+            chunk = output_texts[i:i + chunk_size]
+            chunk_tokens = [tokenizer.encode_as_ids(text) for text in chunk]
+            output_tokens.extend(chunk_tokens)
+            print(f"    Processed {min(i + chunk_size, len(output_texts)):,}/{len(output_texts):,} outputs")
+        
+        # Add to DataFrame
+        df_result = df.copy()
+        df_result["input_tokens"] = input_tokens
+        df_result["output_tokens"] = output_tokens
+        
+        elapsed = time.time() - start_time
+        print(f"  Completed {dataset_name} in {elapsed:.2f}s ({len(df)/elapsed:.0f} rows/sec)")
+        
+        return df_result
+    
+    # Process both datasets
+    train_tokenized = tokenize_single_dataset(train_set, "train")
+    val_tokenized = tokenize_single_dataset(val_set, "validation")
+    
+    return train_tokenized, val_tokenized
