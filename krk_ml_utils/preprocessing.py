@@ -802,3 +802,233 @@ def tokenize_datasets_optimized(train_set, val_set, tokenizer, chunk_size=50000)
     val_tokenized = tokenize_single_dataset(val_set, "validation")
     
     return train_tokenized, val_tokenized
+
+
+## TOKENIZATION OPTIMIZATIONS
+
+def tokenize_columns_memory_efficient_parallel(df, input_col="input", output_col="output", 
+                                             tokenizer=None, chunk_size=5000, n_workers=None):
+    """
+    Memory-efficient parallel tokenization that processes one column at a time.
+    
+    Args:
+        df: DataFrame with input/output columns
+        input_col: Name of input column
+        output_col: Name of output column
+        tokenizer: SentencePiece tokenizer object
+        chunk_size: Size of chunks for parallel processing (smaller for memory efficiency)
+        n_workers: Number of parallel workers
+    
+    Returns:
+        DataFrame with added token columns
+    """
+    import gc
+    import time
+    
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 1)
+    
+    print(f"Starting memory-efficient parallel tokenization with {n_workers} workers...")
+    print(f"Chunk size: {chunk_size:,}")
+    
+    df_result = df.copy()
+    
+    # Process each column separately to minimize memory usage
+    for col_name, token_col_name in [(input_col, "input_tokens"), (output_col, "output_tokens")]:
+        print(f"\nProcessing {col_name} column ({len(df):,} rows)...")
+        start_time = time.time()
+        
+        # Get texts as list
+        texts = df_result[col_name].astype(str).tolist()
+        
+        # Create chunks
+        chunks = []
+        for i in range(0, len(texts), chunk_size):
+            chunk_texts = texts[i:i + chunk_size]
+            chunks.append((chunk_texts, tokenizer, "<s>", "</s>"))
+        
+        print(f"  Created {len(chunks)} chunks")
+        
+        # Process chunks in parallel with memory management
+        if n_workers > 1 and len(chunks) > 1:
+            # Process in batches to control memory usage
+            batch_size = max(1, n_workers * 2)  # Process 2x workers worth of chunks at a time
+            all_tokens = [None] * len(chunks)
+            
+            for batch_start in range(0, len(chunks), batch_size):
+                batch_end = min(batch_start + batch_size, len(chunks))
+                batch_chunks = chunks[batch_start:batch_end]
+                
+                print(f"    Processing batch {batch_start//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}")
+                
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    future_to_idx = {
+                        executor.submit(_tokenize_chunk, chunk): batch_start + i 
+                        for i, chunk in enumerate(batch_chunks)
+                    }
+                    
+                    for future in as_completed(future_to_idx):
+                        chunk_idx = future_to_idx[future]
+                        try:
+                            all_tokens[chunk_idx] = future.result()
+                        except Exception as exc:
+                            print(f'    Chunk {chunk_idx} failed: {exc}')
+                            # Fallback to sequential processing for this chunk
+                            all_tokens[chunk_idx] = _tokenize_chunk(chunks[chunk_idx])
+                
+                # Force garbage collection after each batch
+                gc.collect()
+                
+                # Progress update
+                processed_rows = min(batch_end * chunk_size, len(texts))
+                print(f"    Completed {processed_rows:,}/{len(texts):,} rows")
+            
+            # Flatten results
+            final_tokens = []
+            for token_list in all_tokens:
+                final_tokens.extend(token_list)
+            
+            df_result[token_col_name] = final_tokens
+            
+        else:
+            # Single-threaded processing
+            all_tokens = []
+            for i, chunk in enumerate(chunks):
+                tokens = _tokenize_chunk(chunk)
+                all_tokens.extend(tokens)
+                if i % 10 == 0:
+                    processed = min((i + 1) * chunk_size, len(texts))
+                    print(f"    Processed {processed:,}/{len(texts):,} rows")
+            
+            df_result[token_col_name] = all_tokens
+        
+        # Cleanup after each column
+        del texts, chunks, all_tokens
+        gc.collect()
+        
+        elapsed = time.time() - start_time
+        print(f"  Completed {col_name} in {elapsed:.2f}s ({len(df)/elapsed:.0f} rows/sec)")
+    
+    return df_result
+
+
+def tokenize_datasets_large_scale(train_set, val_set, tokenizer, 
+                                chunk_size=5000, n_workers=None, 
+                                save_checkpoints=True, checkpoint_dir="./checkpoints"):
+    """
+    Large-scale tokenization with checkpointing and memory management.
+    
+    Args:
+        train_set: Training DataFrame
+        val_set: Validation DataFrame
+        tokenizer: SentencePiece tokenizer
+        chunk_size: Chunk size (smaller for large datasets)
+        n_workers: Number of workers
+        save_checkpoints: Whether to save intermediate results
+        checkpoint_dir: Directory for checkpoints
+    
+    Returns:
+        tuple: (tokenized_train_set, tokenized_val_set)
+    """
+    import os
+    import pickle
+    import gc
+    
+    if save_checkpoints:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    def process_dataset_with_checkpoints(df, dataset_name):
+        checkpoint_file = os.path.join(checkpoint_dir, f"{dataset_name}_tokenized.pkl") if save_checkpoints else None
+        
+        # Check if checkpoint exists
+        if checkpoint_file and os.path.exists(checkpoint_file):
+            print(f"Loading {dataset_name} from checkpoint...")
+            with open(checkpoint_file, 'rb') as f:
+                return pickle.load(f)
+        
+        print(f"\nTokenizing {dataset_name} set ({len(df):,} rows)")
+        
+        # Process with memory-efficient parallel tokenization
+        result = tokenize_columns_memory_efficient_parallel(
+            df, 
+            tokenizer=tokenizer, 
+            chunk_size=chunk_size, 
+            n_workers=n_workers
+        )
+        
+        # Save checkpoint
+        if checkpoint_file:
+            print(f"Saving {dataset_name} checkpoint...")
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(result, f)
+        
+        # Force garbage collection
+        gc.collect()
+        
+        return result
+    
+    # Process datasets sequentially to manage memory
+    print("=== Processing Training Set ===")
+    train_result = process_dataset_with_checkpoints(train_set, "train")
+    
+    # Force cleanup before processing validation set
+    gc.collect()
+    
+    print("\n=== Processing Validation Set ===")
+    val_result = process_dataset_with_checkpoints(val_set, "val")
+    
+    return train_result, val_result
+
+
+# Ultra memory-efficient version for extremely large datasets
+def tokenize_columns_streaming(df, input_col="input", output_col="output", 
+                             tokenizer=None, chunk_size=1000, n_workers=None):
+    """
+    Streaming tokenization that processes data in very small chunks to minimize memory.
+    Best for datasets that don't fit in memory.
+    """
+    import gc
+    import time
+    
+    if n_workers is None:
+        n_workers = max(1, mp.cpu_count() - 1)
+    
+    print(f"Starting streaming tokenization with chunk size {chunk_size:,}")
+    
+    # Initialize result lists
+    input_tokens = []
+    output_tokens = []
+    
+    # Process in small batches
+    for i in range(0, len(df), chunk_size):
+        batch_df = df.iloc[i:i + chunk_size].copy()
+        
+        # Process this batch
+        batch_result = tokenize_columns_memory_efficient_parallel(
+            batch_df,
+            input_col=input_col,
+            output_col=output_col,
+            tokenizer=tokenizer,
+            chunk_size=min(500, chunk_size // 2),  # Even smaller chunks for parallel processing
+            n_workers=min(n_workers, 2)  # Fewer workers to save memory
+        )
+        
+        # Extend result lists
+        input_tokens.extend(batch_result["input_tokens"].tolist())
+        output_tokens.extend(batch_result["output_tokens"].tolist())
+        
+        # Cleanup
+        del batch_df, batch_result
+        gc.collect()
+        
+        # Progress
+        processed = min(i + chunk_size, len(df))
+        if i % (chunk_size * 10) == 0:
+            print(f"Processed {processed:,}/{len(df):,} rows")
+    
+    # Create final result
+    result_df = df.copy()
+    result_df["input_tokens"] = input_tokens
+    result_df["output_tokens"] = output_tokens
+    
+    return result_df

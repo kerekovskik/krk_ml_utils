@@ -17,3 +17,4 @@ cloudpickle
 safetensors
 ## For NLP
 tokenizers
+sentencepiece
