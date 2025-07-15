@@ -29,7 +29,7 @@ class Vanilla_Transformer_v1(nnx.Module):
         self.embedding = nnx.Embed(
              num_embeddings=self.vocab_size,
              features=self.d_model,
-             rngs=self,
+             rngs=self.rngs,
              param_dtype=self.param_dtype
              )
         

@@ -706,7 +706,7 @@ class PositionalEncoding(nnx.Module):
         # The formula is 1 / 10000^(2i/d_model).
         # We compute this in log-space for numerical stability.
         div_term = jnp.exp(
-            jnp.arange(0, d_model, 2,dtype=param_dtype) * -(jnp.log(10000.0) / d_model)
+            jnp.arange(0, d_model, 2, dtype=param_dtype) * -(jnp.log(10000.0) / d_model)
         )
 
         # Calculate the sines for even indices
