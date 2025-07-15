@@ -34,7 +34,7 @@ class Vanilla_Transformer_v1(nnx.Module):
              )
         
         # Initialize positional encoding
-        self.pos_encoding = PositionalEncoding(self.d_model, self.max_seq_length, rngs=self.rngs)
+        self.pos_encoding = PositionalEncoding(self.d_model, self.max_seq_length, rngs=self.rngs, param_dtype=self.param_dtype)
         
         # Initialize dropout layer
         self.dropout = nnx.Dropout(rate=self.dropout_rate, rngs=self.rngs)
