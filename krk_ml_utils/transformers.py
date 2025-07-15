@@ -29,7 +29,8 @@ class Vanilla_Transformer_v1(nnx.Module):
         self.embedding = nnx.Embed(
              num_embeddings=self.vocab_size,
              features=self.d_model,
-             rngs=self.rngs
+             rngs=self,
+             param_dtype=self.param_dtype
              )
         
         # Initialize positional encoding
@@ -45,7 +46,8 @@ class Vanilla_Transformer_v1(nnx.Module):
             num_heads=self.num_heads_enc,
             d_ff=self.d_dff_enc,
             rngs=self.rngs,
-            dropout_rate=self.dropout_rate
+            dropout_rate=self.dropout_rate,
+            param_dtype=self.param_dtype
         )
         
         # Initialize the decoder
@@ -55,11 +57,15 @@ class Vanilla_Transformer_v1(nnx.Module):
             num_heads=self.num_heads_dec,
             d_ff=self.d_dff_dec,
             rngs=self.rngs,
-            dropout_rate=self.dropout_rate
+            dropout_rate=self.dropout_rate,
+            param_dtype=self.param_dtype
         )
         
         
-    def __init__(self, vocab_size: int, d_model: int, max_seq_length: int, num_layers_enc: int, num_layers_dec: int, num_heads_enc: int, num_heads_dec: int, d_dff_enc: int, d_dff_dec: int, seed: int = 42, dropout_rate: float = 0.1):
+    def __init__(self, vocab_size: int, d_model: int, max_seq_length: int, num_layers_enc: int, num_layers_dec: int, num_heads_enc: int, num_heads_dec: int, d_dff_enc: int, d_dff_dec: int, seed: int = 42, dropout_rate: float = 0.1, param_dtype: jnp.dtype = jnp.float32):
+        """
+        Initializes the Vanilla Transformer model.
+        """
         super().__init__()
         
         # Initialize model parameters
@@ -75,6 +81,7 @@ class Vanilla_Transformer_v1(nnx.Module):
         self.dropout_rate = dropout_rate
         self.seed = seed
         self.rngs = nnx.Rngs(self.seed)
+        self.param_dtype = param_dtype
         self._initFunc()
 
     def __call__(self, source_tokens: jnp.ndarray, target_tokens: jnp.ndarray, training: bool = False, pad_token_id: int = 250002) -> jnp.ndarray:
@@ -167,7 +174,7 @@ class Vanilla_Transformer_v1(nnx.Module):
 
         # 1c. Initialize the decoder's caches. This pre-computes cross-attention
         # K/V and pre-allocates memory for self-attention K/V.
-        self.decoder.init_cache(batch_size, max_generate_len, encoder_context)
+        self.decoder.init_cache(batch_size, max_generate_len, encoder_context, self.param_dtype)
         
         # 1d. Prepare the initial state for the generation loop.
         # Start with the `start_token_id` for each sequence in the batch.

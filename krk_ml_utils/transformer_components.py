@@ -29,7 +29,7 @@ class FFN(nnx.Module):
     dimension `d_model` to a larger inner dimension `d_ff` and then contracts
     it back to `d_model`.
     """
-    def __init__(self, d_model: int, d_ff: int, *, rngs: nnx.Rngs):
+    def __init__(self, d_model: int, d_ff: int, *, rngs: nnx.Rngs, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes the Feed-Forward Network module.
 
@@ -39,10 +39,10 @@ class FFN(nnx.Module):
             rngs: The JAX random number generators required by Flax NNX.
         """
         # The first linear layer expands the input from d_model to d_ff.
-        self.linear1 = nnx.Linear(d_model, d_ff, rngs=rngs)
+        self.linear1 = nnx.Linear(d_model, d_ff, rngs=rngs, param_dtype=param_dtype)
         
         # The second linear layer contracts the representation back to d_model.
-        self.linear2 = nnx.Linear(d_ff, d_model, rngs=rngs)
+        self.linear2 = nnx.Linear(d_ff, d_model, rngs=rngs, param_dtype=param_dtype)
 
     def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
         """
@@ -81,7 +81,7 @@ class MultiHeadAttention(nnx.Module):
     dropout on its final output.
     """
     
-    def __init__(self, d_model: int, num_heads: int, dropout_rate: float = 0.1, *, rngs: nnx.Rngs):
+    def __init__(self, d_model: int, num_heads: int, dropout_rate: float = 0.1, *, rngs: nnx.Rngs, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes the Multi-Head Attention module.
 
@@ -102,12 +102,12 @@ class MultiHeadAttention(nnx.Module):
 
         # A single, large linear layer is used for each of Q, K, and V for computational
         # efficiency, rather than creating separate layers for each head.
-        self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.key_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.value_proj = nnx.Linear(d_model, d_model, rngs=rngs)
+        self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs, param_dtype=param_dtype)
+        self.key_proj =   nnx.Linear(d_model, d_model, rngs=rngs, param_dtype=param_dtype)
+        self.value_proj = nnx.Linear(d_model, d_model, rngs=rngs, param_dtype=param_dtype)
 
         # The final linear layer that combines the outputs of all heads.
-        self.output_proj = nnx.Linear(d_model, d_model, rngs=rngs)
+        self.output_proj = nnx.Linear(d_model, d_model, rngs=rngs, param_dtype=param_dtype)
         
         # --- Internal Dropout for Attention Weights ---
         # This is applied to the attention scores after the softmax operation.
@@ -116,7 +116,7 @@ class MultiHeadAttention(nnx.Module):
         # --- KV Cache for Efficient Inference ---
         self.cache = KVCache()
 
-    def init_cache(self, batch_size: int, max_seq_len: int):
+    def init_cache(self, batch_size: int, max_seq_len: int, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes the Key-Value cache with zero-filled tensors.
 
@@ -132,8 +132,8 @@ class MultiHeadAttention(nnx.Module):
         value_shape = (batch_size, self.num_heads, max_seq_len, self.d_head)
         
         # Initialize the mutable Variables within the cache.
-        self.cache.key.value = jnp.zeros(key_shape)
-        self.cache.value.value = jnp.zeros(value_shape)
+        self.cache.key.value = jnp.zeros(key_shape, dtype=param_dtype)
+        self.cache.value.value = jnp.zeros(value_shape, dtype=param_dtype)
         
     def generate_step(self, query: jnp.ndarray, key: jnp.ndarray, value: jnp.ndarray, decode_step_index: int):
         """
@@ -273,7 +273,7 @@ class TransformerEncoder(nnx.Module):
     to ensure deterministic execution and robust serialization.
     """
 
-    def __init__(self, num_layers: int, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs):
+    def __init__(self, num_layers: int, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes the complete Transformer Encoder.
 
@@ -296,13 +296,14 @@ class TransformerEncoder(nnx.Module):
                 num_heads=num_heads,
                 d_ff=d_ff,
                 dropout_rate=dropout_rate,
-                rngs=rngs
+                rngs=rngs,
+                param_dtype=param_dtype
             )
             for i in range(self.num_layers)
         }
         
         # A final layer normalization is applied after the entire stack.
-        self.norm = nnx.LayerNorm(num_features=d_model, rngs=rngs)
+        self.norm = nnx.LayerNorm(num_features=d_model, rngs=rngs, param_dtype=param_dtype)
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray | None, training: bool = False):
         """
@@ -333,27 +334,28 @@ class TransformerEncoderLayer(nnx.Module):
     A single layer of the Transformer Encoder, containing a Multi-Head Attention
     sub-layer and a Feed-Forward Network sub-layer.
     """
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs):
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout_rate, rngs=rngs)
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs, param_dtype: jnp.dtype = jnp.float32):
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout_rate, rngs=rngs, param_dtype=param_dtype)
         self.ffn = FFN(
-            d_model=d_model, 
+            d_model=d_model,
             d_ff=d_ff,
-            rngs=rngs
+            rngs=rngs,
+            param_dtype=param_dtype
             )
         
         # We need two LayerNorms and two Dropouts for the two sub-layers
-        self.norm1 = nnx.LayerNorm(num_features=d_model, rngs=rngs)
-        self.norm2 = nnx.LayerNorm(num_features=d_model, rngs=rngs)
+        self.norm1 = nnx.LayerNorm(num_features=d_model, rngs=rngs, param_dtype=param_dtype)
+        self.norm2 = nnx.LayerNorm(num_features=d_model, rngs=rngs, param_dtype=param_dtype)
         self.dropout1 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.dropout2 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray | None, training: bool):
         # 1. First Sub-layer: Multi-Head Self-Attention
         attn_output = self.self_attn(
-            query=x, 
-            key=x, 
-            value=x, 
-            mask=mask, 
+            query=x,
+            key=x,
+            value=x,
+            mask=mask,
             training=training
         )
         # Apply dropout, then the residual connection, then layer normalization
@@ -381,7 +383,7 @@ class TransformerDecoderLayer(nnx.Module):
     Each sub-layer is followed by a residual connection and layer normalization,
     as described by the formula: `LayerNorm(x + Dropout(Sublayer(x)))`.
     """
-    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes the Transformer Decoder Layer.
 
@@ -394,19 +396,19 @@ class TransformerDecoderLayer(nnx.Module):
         """
         # --- Sub-layer Modules ---
         # The first sub-layer is for causal self-attention on the target sequence.
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout_rate, rngs=rngs)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout_rate, rngs=rngs, param_dtype=param_dtype)
         
         # The second sub-layer is for cross-attention, attending to the encoder context.
-        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout_rate, rngs=rngs)
+        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout_rate, rngs=rngs, param_dtype=param_dtype)
         
         # The third sub-layer is the position-wise feed-forward network.
-        self.ffn = FFN(d_model, d_ff, rngs=rngs)
+        self.ffn = FFN(d_model, d_ff, rngs=rngs, param_dtype=param_dtype)
         
         # --- Layer Normalization and Dropout ---
         # We need three of each for the three sub-layers.
-        self.norm1 = nnx.LayerNorm(num_features=d_model, rngs=rngs)
-        self.norm2 = nnx.LayerNorm(num_features=d_model, rngs=rngs)
-        self.norm3 = nnx.LayerNorm(num_features=d_model, rngs=rngs)
+        self.norm1 = nnx.LayerNorm(num_features=d_model, rngs=rngs, param_dtype=param_dtype)
+        self.norm2 = nnx.LayerNorm(num_features=d_model, rngs=rngs, param_dtype=param_dtype)
+        self.norm3 = nnx.LayerNorm(num_features=d_model, rngs=rngs, param_dtype=param_dtype)
         
         self.dropout1 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.dropout2 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
@@ -418,7 +420,7 @@ class TransformerDecoderLayer(nnx.Module):
         self.cached_cross_key = nnx.Variable(None)
         self.cached_cross_value = nnx.Variable(None)
 
-    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray):
+    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes all caches required for efficient inference.
 
@@ -431,7 +433,7 @@ class TransformerDecoderLayer(nnx.Module):
             encoder_context: The final output of the encoder.
         """
         # 1. Initialize the dynamic cache for the self-attention module.
-        self.self_attn.init_cache(batch_size, max_seq_len)
+        self.self_attn.init_cache(batch_size, max_seq_len, param_dtype=param_dtype)
 
         # 2. Pre-compute and cache the static Key and Value for cross-attention.
         # This is a one-time computation that saves significant time during generation.
@@ -549,7 +551,7 @@ class TransformerDecoder(nnx.Module):
     to ensure deterministic execution and robust serialization.
     """
     
-    def __init__(self, num_layers: int, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs):
+    def __init__(self, num_layers: int, d_model: int, num_heads: int, d_ff: int, dropout_rate: float, *, rngs: nnx.Rngs, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes the complete Transformer Decoder.
 
@@ -572,15 +574,16 @@ class TransformerDecoder(nnx.Module):
                 num_heads=num_heads,
                 d_ff=d_ff,
                 dropout_rate=dropout_rate,
-                rngs=rngs
+                rngs=rngs,
+                param_dtype=param_dtype
             )
             for i in range(self.num_layers)
         }
         
         # A final layer normalization is applied after the entire stack.
-        self.norm = nnx.LayerNorm(num_features=d_model, rngs=rngs)
+        self.norm = nnx.LayerNorm(num_features=d_model, rngs=rngs, param_dtype=param_dtype)
 
-    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray):
+    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray, param_dtype: jnp.dtype = jnp.float32):
         """
         Initializes the caches for all layers in this decoder.
 
@@ -596,7 +599,7 @@ class TransformerDecoder(nnx.Module):
         """
         for i in range(self.num_layers):
             layer = self.layers[f"layer_{i}"]
-            layer.init_cache(batch_size, max_seq_len, encoder_context)
+            layer.init_cache(batch_size, max_seq_len, encoder_context, param_dtype=param_dtype)
 
     def generate_step(self, 
                       y: jnp.ndarray, 
@@ -684,6 +687,7 @@ class PositionalEncoding(nnx.Module):
         max_len: int = 5000,
         *,
         rngs: nnx.Rngs,  # NNX Modules require rngs for initialization
+        param_dtype: jnp.dtype = jnp.float32
     ):
         """
         Args:
@@ -693,16 +697,16 @@ class PositionalEncoding(nnx.Module):
         """
         # Create a (max_len, d_model) matrix to store the encodings.
         # This is a regular JAX array, not an nnx.Param, because it's fixed.
-        pe = jnp.zeros((max_len, d_model))
+        pe = jnp.zeros((max_len, d_model), dtype=param_dtype)
 
         # Create a vector of positions [0, 1, ..., max_len-1]
-        position = jnp.arange(0, max_len, dtype=jnp.float32).reshape(-1, 1)
+        position = jnp.arange(0, max_len, dtype=param_dtype).reshape(-1, 1)
 
         # Create the denominator term for the frequencies.
         # The formula is 1 / 10000^(2i/d_model).
         # We compute this in log-space for numerical stability.
         div_term = jnp.exp(
-            jnp.arange(0, d_model, 2) * -(jnp.log(10000.0) / d_model)
+            jnp.arange(0, d_model, 2,dtype=param_dtype) * -(jnp.log(10000.0) / d_model)
         )
 
         # Calculate the sines for even indices
