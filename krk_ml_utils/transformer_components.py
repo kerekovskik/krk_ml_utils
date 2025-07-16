@@ -1004,7 +1004,7 @@ class TransformerEncoderLayer_t5(nnx.Module):
             training=training
         )
         # Apply dropout and add the residual connection to the original 'x'.
-        x = x + self.dropout1(attn_output, deterministic=not training)
+        x = self.dropout1(x + attn_output, deterministic=not training)
 
         # 2. Second Sub-layer: Feed-Forward Network (with Pre-Norm)
         # First, normalize the output of the first sub-layer.
@@ -1012,7 +1012,7 @@ class TransformerEncoderLayer_t5(nnx.Module):
         # Then, pass it to the FFN.
         ffn_output = self.ffn(norm_x_2, training=training)
         # Apply dropout and add the residual connection.
-        x = x + self.dropout2(ffn_output, deterministic=not training)
+        x = self.dropout2(x + ffn_output, deterministic=not training)
 
         return x
 
@@ -1111,7 +1111,7 @@ class TransformerDecoderLayer_t5(nnx.Module):
             value=norm_y_1,
             decode_step_index=decode_step_index
         )
-        y = y + self.dropout1(self_attn_output, deterministic=True) # Dropout is off during inference
+        y = self.dropout1(y + self_attn_output, deterministic=True) # Dropout is off during inference
 
         # 2. Cross-Attention with static cache (Pre-Norm)
         norm_y_2 = self.norm2(y)
@@ -1119,12 +1119,12 @@ class TransformerDecoderLayer_t5(nnx.Module):
             query=norm_y_2,
             mask=cross_attn_mask
         )
-        y = y + self.dropout2(cross_attn_output, deterministic=True)
+        y = self.dropout2(y + cross_attn_output, deterministic=True)
 
         # 3. Feed-Forward Network (Pre-Norm)
         norm_y_3 = self.norm3(y)
         ffn_output = self.ffn(norm_y_3, training=False)
-        y = y + self.dropout3(ffn_output, deterministic=True)
+        y = self.dropout3(y + ffn_output, deterministic=True)
 
         return y
 
@@ -1415,10 +1415,10 @@ class MultiHeadAttention_t5(nnx.Module):
         self.d_head = d_model // num_heads
 
         # --- Learnable Layers ---
-        self.query_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.key_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.value_proj = nnx.Linear(d_model, d_model, rngs=rngs)
-        self.output_proj = nnx.Linear(d_model, d_model, rngs=rngs)
+        self.query_proj = nnx.Linear(d_model,  d_model, use_bias=False, rngs=rngs)
+        self.key_proj = nnx.Linear(d_model,    d_model, use_bias=False, rngs=rngs)
+        self.value_proj = nnx.Linear(d_model,  d_model, use_bias=False, rngs=rngs)
+        self.output_proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
 
         # --- Internal Dropout for Attention Weights ---
         self.attn_dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
