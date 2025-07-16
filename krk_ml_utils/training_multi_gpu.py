@@ -115,6 +115,7 @@ def train_flax_lm(
     eval_every_steps: Optional[int] = 1000,
     accumulation_steps: int = 1,
     resume_from_checkpoint: bool = True,
+    new_schedule_step: int = None,
 ) -> Tuple[nnx.Module, Dict[str, list]]:
     """
     Trains a Flax NNX model with gradient accumulation and intra-epoch checkpointing.
@@ -212,6 +213,42 @@ def train_flax_lm(
             # Replace the current model and optimizer with loaded ones
             # This ensures we get the exact same architecture and state
             model = loaded_model
+            #optimizer = loaded_optimizer
+            ###
+            if new_schedule_step is not None:
+                print("Found new_lr_schedule. Attempting to replace optimizer's LR.")
+###
+                if (hasattr(loaded_optimizer, 'step') and
+                    hasattr(loaded_optimizer, 'opt_state') and
+                    len(loaded_optimizer.opt_state) >= 2):
+
+                    print(f"Original main step: {loaded_optimizer.step.value}")
+                    print(f"Original Adam count: {loaded_optimizer.opt_state[0].count.value}")
+                    print(f"Original Schedule count: {loaded_optimizer.opt_state[1].count.value}")
+                    print("-" * 20)
+
+                    # Create the new value we want to set
+                    new_value = jnp.array(new_schedule_step, dtype=loaded_optimizer.step.value.dtype)
+
+                    # 1. Modify the main step counter directly
+                    loaded_optimizer.step.value = jnp.array(new_value, dtype=loaded_optimizer.step.value.dtype)
+
+                    # 2. Modify the internal counts directly
+                    #    Because the state objects are mutable, we can just assign the new value.
+                    adam_state = loaded_optimizer.opt_state[0]
+                    schedule_state = loaded_optimizer.opt_state[1]
+
+                    adam_state.count.value = jnp.array(new_value, dtype=adam_state.count.value.dtype)
+                    schedule_state.count.value = jnp.array(new_value, dtype=schedule_state.count.value.dtype)
+
+                    print(f"✅ Modified main step: {loaded_optimizer.step.value}")
+                    print(f"✅ Modified Adam count: {loaded_optimizer.opt_state[0].count.value}")
+                    print(f"✅ Modified Schedule count: {loaded_optimizer.opt_state[1].count.value}")
+                else:
+                    print("❌ Unable to modify optimizer state: missing step or opt_state structure.")
+                    print(f"Current optimizer state: {loaded_optimizer.opt_state}")
+                    print("Using loaded optimizer as is, without modification.")
+
             optimizer = loaded_optimizer
             optimizer.model = model
 
@@ -330,7 +367,8 @@ def train_flax_lm(
                 metrics_history["global_step"].append(global_step)
                 train_metrics_str = ", ".join([f"{k.title()}: {v:.4f}" for k, v in train_metrics.items()])
                 datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"{datetime_str} | Step {global_step:<7} | Epoch {epoch + 1:<4} | Train {train_metrics_str}")
+                opt_step = loaded_optimizer.step.value if hasattr(loaded_optimizer, 'step') else optimizer.step.value
+                print(f"{datetime_str} | Step {global_step:<7} | Epoch {epoch + 1:<4} | Train {train_metrics_str} | OPT_STEP: {opt_step}")
 
             if test_dataloader and eval_every_steps and (global_step % eval_every_steps == 0):
                 model.eval()
