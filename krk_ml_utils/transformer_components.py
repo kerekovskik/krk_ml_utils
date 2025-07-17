@@ -751,7 +751,7 @@ class FFN_GEGLU(nnx.Module):
     """
     Implements the Gated GELU (GEGLU) Feed-Forward Network used in T5.
     """
-    def __init__(self, d_model: int, d_ff: int, *, rngs: nnx.Rngs):
+    def __init__(self, d_model: int, d_ff: int, *, rngs: nnx.Rngs, param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the GEGLU FFN.
 
@@ -759,12 +759,13 @@ class FFN_GEGLU(nnx.Module):
             d_model: The dimensionality of the input and output.
             d_ff: The dimensionality of the inner "up-projection".
             rngs: The JAX random number generators.
+            param_dtype: The parameter dtype for the linear layers.
         """
         # The up-projection layer is split into two for the gating mechanism.
-        self.linear_gate = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
-        self.linear_up = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
+        self.linear_gate = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
+        self.linear_up = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
         # The down-projection layer.
-        self.linear_down = nnx.Linear(d_ff, d_model, use_bias=False, rngs=rngs)
+        self.linear_down = nnx.Linear(d_ff, d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
 
     def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
         # Project up to the intermediate dimension with two separate matrices.
@@ -796,7 +797,8 @@ class RelativePositionBias(nnx.Module):
                  max_distance: int,
                  num_heads: int,
                  *,
-                 rngs: nnx.Rngs):
+                 rngs: nnx.Rngs,
+                 param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the RelativePositionBias module.
 
@@ -807,6 +809,7 @@ class RelativePositionBias(nnx.Module):
             num_heads: The number of attention heads. The bias will have a dimension
                        for each head.
             rngs: The JAX random number generators required by Flax NNX.
+            param_dtype: The parameter dtype for the bias embeddings.
         """
         self.num_buckets = num_buckets
         self.max_distance = max_distance
@@ -815,7 +818,7 @@ class RelativePositionBias(nnx.Module):
         # This is the learnable parameter. It's an embedding table where each bucket
         # has a corresponding vector of size num_heads.
         self.relative_attention_bias = nnx.Param(
-            nnx.initializers.normal(stddev=1.0)(rngs.params(), (num_heads, num_buckets))
+            nnx.initializers.normal(stddev=1.0)(rngs.params(), (num_heads, num_buckets), dtype=param_dtype)  # Added param_dtype
         )
 
     @staticmethod
@@ -946,7 +949,8 @@ class TransformerEncoderLayer_t5(nnx.Module):
                  dropout_rate: float,
                  relative_position_bias_module: RelativePositionBias,
                  *,
-                 rngs: nnx.Rngs):
+                 rngs: nnx.Rngs,
+                 param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the T5-style Transformer Encoder Layer.
 
@@ -958,6 +962,7 @@ class TransformerEncoderLayer_t5(nnx.Module):
             relative_position_bias_module: The *shared* instance of the
                                            RelativePositionBias module.
             rngs: The JAX random number generators required by Flax NNX.
+            param_dtype: The parameter dtype for the layer components.
         """
         # --- Sub-layer Modules ---
         # Instantiate the T5-style attention module, passing the shared bias module.
@@ -966,14 +971,15 @@ class TransformerEncoderLayer_t5(nnx.Module):
             num_heads=num_heads,
             dropout_rate=dropout_rate,
             relative_position_bias_module=relative_position_bias_module,
-            rngs=rngs
+            rngs=rngs,
+            param_dtype=param_dtype  # Added param_dtype
         )
-        self.ffn = FFN_GEGLU(d_model=d_model, d_ff=d_ff, rngs=rngs)
+        self.ffn = FFN_GEGLU(d_model=d_model, d_ff=d_ff, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
 
         # --- Layer Normalization and Dropout ---
         # Initialize two simplified LayerNorm modules (no bias) for pre-norm.
-        self.norm1 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs)
-        self.norm2 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs)
+        self.norm1 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
+        self.norm2 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
         # Initialize dropout layers for the output of each sub-layer.
         self.dropout1 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.dropout2 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
@@ -994,17 +1000,16 @@ class TransformerEncoderLayer_t5(nnx.Module):
         # First, apply layer normalization to the input 'x'.
         norm_x = self.norm1(x)
         # Then, pass the normalized input to the attention sub-layer.
-        # For the encoder, attention is always bidirectional.
         attn_output = self.self_attn(
             query=norm_x,
             key=norm_x,
             value=norm_x,
             mask=mask,
-            bidirectional_attn=True, # Encoder self-attention is always bidirectional
+            bidirectional_attn=True,  # Encoder self-attention is always bidirectional
             training=training
         )
-        # Apply dropout and add the residual connection to the original 'x'.
-        x = self.dropout1(x + attn_output, deterministic=not training)
+        # Apply dropout to the sub-layer's output and add the residual connection.
+        x = x + self.dropout1(attn_output, deterministic=not training)
 
         # 2. Second Sub-layer: Feed-Forward Network (with Pre-Norm)
         # First, normalize the output of the first sub-layer.
@@ -1012,7 +1017,7 @@ class TransformerEncoderLayer_t5(nnx.Module):
         # Then, pass it to the FFN.
         ffn_output = self.ffn(norm_x_2, training=training)
         # Apply dropout and add the residual connection.
-        x = self.dropout2(x + ffn_output, deterministic=not training)
+        x = x + self.dropout2(ffn_output, deterministic=not training)
 
         return x
 
@@ -1033,7 +1038,8 @@ class TransformerDecoderLayer_t5(nnx.Module):
                  dropout_rate: float,
                  relative_position_bias_module: RelativePositionBias,
                  *,
-                 rngs: nnx.Rngs):
+                 rngs: nnx.Rngs,
+                 param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the T5-style Transformer Decoder Layer.
 
@@ -1045,6 +1051,7 @@ class TransformerDecoderLayer_t5(nnx.Module):
             relative_position_bias_module: The *shared* instance of the
                                            RelativePositionBias module.
             rngs: The JAX random number generators required by Flax NNX.
+            param_dtype: The parameter dtype for the layer components.
         """
         # --- Sub-layer Modules ---
         # Instantiate two T5-style attention modules, passing the same shared bias module to both.
@@ -1053,36 +1060,43 @@ class TransformerDecoderLayer_t5(nnx.Module):
             num_heads=num_heads,
             dropout_rate=dropout_rate,
             relative_position_bias_module=relative_position_bias_module,
-            rngs=rngs
+            rngs=rngs,
+            param_dtype=param_dtype  # Added param_dtype
         )
         self.cross_attn = MultiHeadAttention_t5(
             d_model=d_model,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
             relative_position_bias_module=relative_position_bias_module,
-            rngs=rngs
+            rngs=rngs,
+            param_dtype=param_dtype  # Added param_dtype
         )
-        self.ffn = FFN_GEGLU(d_model=d_model, d_ff=d_ff, rngs=rngs)
+        self.ffn = FFN_GEGLU(d_model=d_model, d_ff=d_ff, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
 
         # --- Layer Normalization and Dropout ---
         # Initialize three simplified LayerNorm modules (no bias) for the three sub-layers.
-        self.norm1 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs)
-        self.norm2 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs)
-        self.norm3 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs)
+        self.norm1 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
+        self.norm2 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
+        self.norm3 = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
         # Initialize three dropout layers.
         self.dropout1 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.dropout2 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
         self.dropout3 = nnx.Dropout(rate=dropout_rate, rngs=rngs)
 
-    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray):
+    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray, param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
-        Initializes the caches for both self-attention and cross-attention.
+        Initializes all caches required for efficient inference.
 
-        This method must be called once before starting autoregressive generation.
-        It delegates the actual cache initialization to the respective attention modules.
+        This method pre-computes the static cross-attention keys and values
+        and pre-allocates space for the dynamic self-attention cache.
+
+        Args:
+            batch_size: The batch size for the inference session.
+            max_seq_len: The maximum sequence length for the generation.
+            encoder_context: The final output of the encoder.
         """
         # 1. Initialize the dynamic cache for the self-attention module.
-        self.self_attn.init_cache(batch_size, max_seq_len)
+        self.self_attn.init_cache(batch_size, max_seq_len, param_dtype=param_dtype)  # Added param_dtype
 
         # 2. Initialize the static cache for the cross-attention module.
         # This will pre-compute and store the Keys and Values from the encoder_context.
@@ -1103,28 +1117,34 @@ class TransformerDecoderLayer_t5(nnx.Module):
         Returns:
             The output tensor for the current time step. Shape: (batch, 1, d_model).
         """
-        # 1. Self-Attention with dynamic cache (Pre-Norm)
+        # --- First Sub-layer: Causal Self-Attention (Pre-Norm) ---
+        # Normalize the input token, then pass it to the cached self-attention.
         norm_y_1 = self.norm1(y)
         self_attn_output = self.self_attn.generate_step(
             query=norm_y_1,
-            key=norm_y_1, # For self-attention, Q, K, V are from the same source
+            key=norm_y_1,  # For self-attention, Q, K, V are from the same source
             value=norm_y_1,
             decode_step_index=decode_step_index
         )
-        y = self.dropout1(y + self_attn_output, deterministic=True) # Dropout is off during inference
+        # Add the residual connection. Dropout is a no-op during inference.
+        y = y + self.dropout1(self_attn_output, deterministic=True)
 
-        # 2. Cross-Attention with static cache (Pre-Norm)
+        # --- Second Sub-layer: Cross-Attention (Pre-Norm) ---
+        # Normalize the output of the first sub-layer, then pass to cached cross-attention.
         norm_y_2 = self.norm2(y)
         cross_attn_output = self.cross_attn.generate_step_cross_attention(
             query=norm_y_2,
             mask=cross_attn_mask
         )
-        y = self.dropout2(y + cross_attn_output, deterministic=True)
+        # Add the residual connection.
+        y = y + self.dropout2(cross_attn_output, deterministic=True)
 
-        # 3. Feed-Forward Network (Pre-Norm)
+        # --- Third Sub-layer: Feed-Forward Network (Pre-Norm) ---
+        # Normalize the output of the second sub-layer, then pass to the FFN.
         norm_y_3 = self.norm3(y)
         ffn_output = self.ffn(norm_y_3, training=False)
-        y = self.dropout3(y + ffn_output, deterministic=True)
+        # Add the final residual connection.
+        y = y + self.dropout3(ffn_output, deterministic=True)
 
         return y
 
@@ -1135,7 +1155,7 @@ class TransformerDecoderLayer_t5(nnx.Module):
                  cross_attn_mask: jnp.ndarray | None,
                  training: bool):
         """
-        Performs the full forward pass for one decoder layer during training.
+        Performs the full forward pass for one decoder layer during training using pre-norm.
 
         Args:
             y: The target sequence embeddings. Shape: (batch, target_len, d_model).
@@ -1154,7 +1174,7 @@ class TransformerDecoderLayer_t5(nnx.Module):
             key=norm_y_1,
             value=norm_y_1,
             mask=self_attn_mask,
-            bidirectional_attn=False, # Self-attention in the decoder is causal, not bidirectional
+            bidirectional_attn=False,  # Self-attention in the decoder is causal
             training=training
         )
         y = y + self.dropout1(self_attn_output, deterministic=not training)
@@ -1166,7 +1186,7 @@ class TransformerDecoderLayer_t5(nnx.Module):
             key=encoder_context,
             value=encoder_context,
             mask=cross_attn_mask,
-            bidirectional_attn=True, # Cross-attention can see the whole encoder context
+            bidirectional_attn=True,  # Cross-attention can see the whole encoder context
             training=training
         )
         y = y + self.dropout2(cross_attn_output, deterministic=not training)
@@ -1200,7 +1220,8 @@ class TransformerEncoder_t5(nnx.Module):
                  dropout_rate: float,
                  relative_position_bias_module: RelativePositionBias,
                  *,
-                 rngs: nnx.Rngs):
+                 rngs: nnx.Rngs,
+                 param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the complete T5-style Transformer Encoder.
 
@@ -1213,6 +1234,7 @@ class TransformerEncoder_t5(nnx.Module):
             relative_position_bias_module: The single, shared instance of the
                                            RelativePositionBias module for the entire model.
             rngs: The JAX random number generators required by Flax NNX.
+            param_dtype: The parameter dtype for the encoder components.
         """
         # Store the number of layers as an explicit attribute for deterministic iteration.
         self.num_layers = num_layers
@@ -1227,7 +1249,8 @@ class TransformerEncoder_t5(nnx.Module):
                 d_ff=d_ff,
                 dropout_rate=dropout_rate,
                 relative_position_bias_module=relative_position_bias_module,
-                rngs=rngs
+                rngs=rngs,
+                param_dtype=param_dtype  # Added param_dtype
             )
             for i in range(self.num_layers)
         }
@@ -1235,7 +1258,7 @@ class TransformerEncoder_t5(nnx.Module):
         # A final layer normalization is applied after the entire stack.
         # This is a common practice in pre-norm architectures to stabilize the final output.
         # We use the simplified version (no bias) for consistency.
-        self.norm = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs)
+        self.norm = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray | None, training: bool = False):
         """
@@ -1277,7 +1300,8 @@ class TransformerDecoder_t5(nnx.Module):
                  dropout_rate: float,
                  relative_position_bias_module: RelativePositionBias,
                  *,
-                 rngs: nnx.Rngs):
+                 rngs: nnx.Rngs,
+                 param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the complete T5-style Transformer Decoder.
 
@@ -1290,6 +1314,7 @@ class TransformerDecoder_t5(nnx.Module):
             relative_position_bias_module: The single, shared instance of the
                                            RelativePositionBias module for the entire model.
             rngs: The JAX random number generators required by Flax NNX.
+            param_dtype: The parameter dtype for the decoder components.
         """
         self.num_layers = num_layers
 
@@ -1302,15 +1327,16 @@ class TransformerDecoder_t5(nnx.Module):
                 d_ff=d_ff,
                 dropout_rate=dropout_rate,
                 relative_position_bias_module=relative_position_bias_module,
-                rngs=rngs
+                rngs=rngs,
+                param_dtype=param_dtype  # Added param_dtype
             )
             for i in range(self.num_layers)
         }
 
         # A final layer normalization is applied after the entire stack.
-        self.norm = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs)
+        self.norm = nnx.LayerNorm(num_features=d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
 
-    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray):
+    def init_cache(self, batch_size: int, max_seq_len: int, encoder_context: jnp.ndarray, param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the KV caches for all layers in this decoder stack.
 
@@ -1320,7 +1346,7 @@ class TransformerDecoder_t5(nnx.Module):
         """
         for i in range(self.num_layers):
             layer = self.layers[f"layer_{i}"]
-            layer.init_cache(batch_size, max_seq_len, encoder_context)
+            layer.init_cache(batch_size, max_seq_len, encoder_context, param_dtype=param_dtype)  # Added param_dtype
 
     def generate_step(self,
                       y: jnp.ndarray,
@@ -1385,6 +1411,7 @@ class TransformerDecoder_t5(nnx.Module):
 
         # Apply the final layer normalization to the stack's output.
         return self.norm(y)
+    
 
 class MultiHeadAttention_t5(nnx.Module):
     """
@@ -1403,22 +1430,33 @@ class MultiHeadAttention_t5(nnx.Module):
                  dropout_rate: float,
                  relative_position_bias_module: RelativePositionBias,
                  *,
-                 rngs: nnx.Rngs):
+                 rngs: nnx.Rngs,
+                 param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the T5-style Multi-Head Attention module.
+
+        Args:
+            d_model: The total dimensionality of the model's embeddings.
+            num_heads: The number of parallel attention heads. Must divide d_model.
+            dropout_rate: The dropout rate to apply to the attention weights after softmax.
+            rngs: The JAX random number generators required by Flax NNX.
+            param_dtype: The parameter dtype for the layer components.
         """
         if d_model % num_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
 
         self.d_model = d_model
         self.num_heads = num_heads
-        self.d_head = d_model // num_heads
+        self.d_head = d_model // num_heads  # Dimension of each head's Q, K, V
 
         # --- Learnable Layers ---
-        self.query_proj = nnx.Linear(d_model,  d_model, use_bias=False, rngs=rngs)
-        self.key_proj = nnx.Linear(d_model,    d_model, use_bias=False, rngs=rngs)
-        self.value_proj = nnx.Linear(d_model,  d_model, use_bias=False, rngs=rngs)
-        self.output_proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs)
+
+        # A single, large linear layer is used for each of Q, K, and V for computational
+        # efficiency, rather than creating separate layers for each head.
+        self.query_proj = nnx.Linear(d_model,  d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
+        self.key_proj = nnx.Linear(d_model,    d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
+        self.value_proj = nnx.Linear(d_model,  d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
+        self.output_proj = nnx.Linear(d_model, d_model, use_bias=False, rngs=rngs, param_dtype=param_dtype)  # Added param_dtype
 
         # --- Internal Dropout for Attention Weights ---
         self.attn_dropout = nnx.Dropout(rate=dropout_rate, rngs=rngs)
@@ -1432,7 +1470,7 @@ class MultiHeadAttention_t5(nnx.Module):
         # This cache will be used for STATIC cross-attention state.
         self.cross_attn_cache = KVCache()
 
-    def init_cache(self, batch_size: int, max_seq_len: int):
+    def init_cache(self, batch_size: int, max_seq_len: int, param_dtype: jnp.dtype = jnp.float32):  # Added param_dtype
         """
         Initializes the Key-Value cache for DYNAMIC self-attention.
 
@@ -1442,8 +1480,8 @@ class MultiHeadAttention_t5(nnx.Module):
         """
         key_shape = (batch_size, self.num_heads, max_seq_len, self.d_head)
         value_shape = (batch_size, self.num_heads, max_seq_len, self.d_head)
-        self.self_attn_cache.key.value = jnp.zeros(key_shape)
-        self.self_attn_cache.value.value = jnp.zeros(value_shape)
+        self.self_attn_cache.key.value = jnp.zeros(key_shape, dtype=param_dtype)  # Added param_dtype
+        self.self_attn_cache.value.value = jnp.zeros(value_shape, dtype=param_dtype)  # Added param_dtype
 
     def init_cache_for_cross_attention(self, encoder_context: jnp.ndarray):
         """
@@ -1573,4 +1611,4 @@ class MultiHeadAttention_t5(nnx.Module):
         v_heads = v_proj.reshape(batch_size, v_len, self.num_heads, self.d_head).transpose(0, 2, 1, 3)
 
         return self.calculate_attention(q_heads, k_heads, v_heads, mask, bidirectional_attn, training)
-### T5 
+### T5

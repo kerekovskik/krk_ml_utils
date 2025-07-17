@@ -243,7 +243,8 @@ class T5_Style_Transformer(nnx.Module):
                  num_rel_pos_buckets: int = 32, # FIX: Made configurable
                  max_rel_pos_distance: int = 128, # FIX: Made configurable
                  seed: int = 42,
-                 max_seq_length: int = 512): # Kept for generate method cache sizing
+                 max_seq_length: int = 512, # Kept for generate method cache sizing
+                 param_dtype: jnp.dtype = jnp.float32): # Added param_dtype parameter
         super().__init__()
         # FIX: Added assertions for robustness
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -260,6 +261,7 @@ class T5_Style_Transformer(nnx.Module):
         self.max_rel_pos_distance = max_rel_pos_distance
         self.max_seq_length = max_seq_length
         self.seed = seed
+        self.param_dtype = param_dtype  # Store param_dtype
         self.rngs = nnx.Rngs(self.seed)
         # Call the separated initialization function
         self._initFunc()
@@ -270,15 +272,17 @@ class T5_Style_Transformer(nnx.Module):
         self.embedding = nnx.Embed(
              num_embeddings=self.vocab_size,
              features=self.d_model,
-             rngs=self.rngs
-        )
+             rngs=self.rngs,
+             param_dtype=self.param_dtype  # Added param_dtype
+             )
 
         # Initialize the single, shared relative position bias module.
         self.relative_position_bias = RelativePositionBias(
             num_buckets=self.num_rel_pos_buckets,
             max_distance=self.max_rel_pos_distance,
             num_heads=self.num_heads,
-            rngs=self.rngs
+            rngs=self.rngs,
+            param_dtype=self.param_dtype  # Added param_dtype
         )
 
         # A single dropout layer applied to the embeddings.
@@ -292,7 +296,8 @@ class T5_Style_Transformer(nnx.Module):
             d_ff=self.d_dff,
             dropout_rate=self.dropout_rate,
             relative_position_bias_module=self.relative_position_bias,
-            rngs=self.rngs
+            rngs=self.rngs,
+            param_dtype=self.param_dtype  # Added param_dtype
         )
 
         # Initialize the T5-style decoder.
@@ -303,11 +308,12 @@ class T5_Style_Transformer(nnx.Module):
             d_ff=self.d_dff,
             dropout_rate=self.dropout_rate,
             relative_position_bias_module=self.relative_position_bias,
-            rngs=self.rngs
+            rngs=self.rngs,
+            param_dtype=self.param_dtype  # Added param_dtype
         )
 
         # FIX: Add the final LayerNorm for the decoder output stack.
-        self.final_layer_norm = nnx.LayerNorm(num_features=self.d_model, use_bias=False, rngs=self.rngs)
+        self.final_layer_norm = nnx.LayerNorm(num_features=self.d_model, use_bias=False, rngs=self.rngs, param_dtype=self.param_dtype)  # Added param_dtype
 
 
     def __call__(self, source_tokens: jnp.ndarray, target_tokens: jnp.ndarray, training: bool = False, pad_token_id: int = 0) -> jnp.ndarray:
@@ -355,7 +361,7 @@ class T5_Style_Transformer(nnx.Module):
         encoder_context = self.encoder(source_emb, mask=source_mask, training=False)
 
         # --- Phase 2: One-Time Cache Initialization ---
-        self.decoder.init_cache(batch_size, max_generate_len, encoder_context)
+        self.decoder.init_cache(batch_size, max_generate_len, encoder_context, param_dtype=self.param_dtype)  # Added param_dtype
 
         # --- Phase 3: The Autoregressive Loop ---
         generated_tokens = jnp.full((batch_size, 1), start_token_id, dtype=jnp.int32)
