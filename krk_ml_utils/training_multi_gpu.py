@@ -367,7 +367,7 @@ def train_flax_lm(
                 metrics_history["global_step"].append(global_step)
                 train_metrics_str = ", ".join([f"{k.title()}: {v:.4f}" for k, v in train_metrics.items()])
                 datetime_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                opt_step = loaded_optimizer.step.value if hasattr(loaded_optimizer, 'step') else optimizer.step.value
+                opt_step = optimizer.step.value if hasattr(optimizer, 'step') else 'N/A'
                 print(f"{datetime_str} | Step {global_step:<7} | Epoch {epoch + 1:<4} | Train {train_metrics_str} | OPT_STEP: {opt_step}")
 
             if test_dataloader and eval_every_steps and (global_step % eval_every_steps == 0):
